@@ -11,6 +11,7 @@ from typing import (
     Optional,
     Sequence,
     Union,
+    Callable
 )
 from urllib.parse import urlparse
 
@@ -77,15 +78,56 @@ def extract_from_images_with_rapidocr(
             text += "\n".join(result)
     return text
 
+def extract_from_images_with_rapidocr_with_callback(
+    images: Sequence[Union[Iterable[np.ndarray], bytes]],
+    callback: Callable[[str, int, int], None]  # Adding a callback parameter
+) -> str:
+    """Extract text from images with RapidOCR.
+
+    Args:
+        images: Images to extract text from.
+        callback: A function to call after each image is processed. It receives
+                  two integers: the total count of images and the number of images processed.
+
+    Returns:
+        Text extracted from images.
+
+    Raises:
+        ImportError: If `rapidocr-onnxruntime` package is not installed.
+    """
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        raise ImportError(
+            "`rapidocr-onnxruntime` package not found, please install it with "
+            "`pip install rapidocr-onnxruntime`"
+        )
+    ocr = RapidOCR()
+    text = ""
+    total_images = len(images)
+    images_processed = 0
+    for img in images:
+        result, _ = ocr(img)
+        if result:
+            result = [text[1] for text in result]
+            text += "\n".join(result)
+        images_processed += 1
+        callback("Parsing Images", total_images, images_processed)  # Call the callback with the total and processed counts
+    return text
 
 class PyPDFParser(BaseBlobParser):
     """Load `PDF` using `pypdf`"""
 
     def __init__(
-        self, password: Optional[Union[str, bytes]] = None, extract_images: bool = False
+        self, 
+        password: Optional[Union[str, bytes]] = None, 
+        extract_images: bool = False,
+        callback: Optional[Callable[[str, int, int], None]] = None  # Optional callback parameter
     ):
         self.password = password
         self.extract_images = extract_images
+        self.callback = callback  # Store the callback
+
 
     def lazy_parse(self, blob: Blob) -> Iterator[Document]:
         """Lazily parse the blob."""
@@ -93,14 +135,15 @@ class PyPDFParser(BaseBlobParser):
 
         with blob.as_bytes_io() as pdf_file_obj:
             pdf_reader = pypdf.PdfReader(pdf_file_obj, password=self.password)
-            yield from [
-                Document(
-                    page_content=page.extract_text()
-                    + self._extract_images_from_page(page),
+            for page_number, page in enumerate(pdf_reader.pages):
+                if self.callback:
+                    page_content = page.extract_text() + self._extract_images_from_page_with_callback(page, self.callback)
+                else:
+                    page_content = page.extract_text() + self._extract_images_from_page(page)
+                yield Document(
+                    page_content=page_content,
                     metadata={"source": blob.source, "page": page_number},
                 )
-                for page_number, page in enumerate(pdf_reader.pages)
-            ]
 
     def _extract_images_from_page(self, page: pypdf._page.PageObject) -> str:
         """Extract images from page and get the text with RapidOCR."""
@@ -124,6 +167,36 @@ class PyPDFParser(BaseBlobParser):
                 else:
                     warnings.warn("Unknown PDF Filter!")
         return extract_from_images_with_rapidocr(images)
+    
+    def _extract_images_from_page_with_callback(self, page: pypdf._page.PageObject, callback) -> str:
+        """Extract images from page and get the text with RapidOCR."""
+        if not self.extract_images or "/XObject" not in page["/Resources"].keys():
+            return ""
+
+        xObject = page["/Resources"]["/XObject"].get_object()
+        images = []
+        object_count = len(xObject)
+        objects_processed = 0
+
+        for obj in xObject:
+            if xObject[obj]["/Subtype"] == "/Image":
+                if xObject[obj]["/Filter"][1:] in _PDF_FILTER_WITHOUT_LOSS:
+                    height, width = xObject[obj]["/Height"], xObject[obj]["/Width"]
+                    # Depending on the color space, the number of channels may vary
+                    num_channels = 3  # Assuming RGB for simplicity, adjust as needed
+                    images.append(
+                        np.frombuffer(xObject[obj].get_data(), dtype=np.uint8).reshape(
+                            height, width, num_channels
+                        )
+                    )
+                elif xObject[obj]["/Filter"][1:] in _PDF_FILTER_WITH_LOSS:
+                    images.append(xObject[obj].get_data())
+                else:
+                    warnings.warn("Unknown PDF Filter!")
+            objects_processed += 1
+            callback("Parsing Pages", object_count, objects_processed)  # Execute callback for each xObject processed
+
+        return extract_from_images_with_rapidocr_with_callback(images, callback)
 
 
 class PDFMinerParser(BaseBlobParser):
